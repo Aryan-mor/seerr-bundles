@@ -1,0 +1,98 @@
+name: Build
+
+# Every day this looks for a Seerr release that has no bundle yet, builds it for Windows and Linux,
+# and publishes it here. Run it by hand with a version to build or rebuild one.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Seerr version without v, for example 3.5.1. Empty means the newest upstream release."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT: ${{ github.event.inputs.version }}
+        run: |
+          if [ -n "$INPUT" ]; then
+            version="$INPUT"
+          else
+            version="$(gh api repos/seerr-team/seerr/releases/latest --jq .tag_name)"
+            version="${version#v}"
+          fi
+          printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not a plain version: $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A release that exists is only rebuilt when someone asks for that version by hand.
+          if [ -z "$INPUT" ] && gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v$version already has a bundle"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { name: windows-amd64, os: windows-latest }
+          - { name: linux-amd64, os: ubuntu-latest }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.24.0
+      # The Node that builds Seerr is the Node that ships in the bundle, so it is pinned exactly.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.4
+      - name: build
+        shell: bash
+        run: scripts/seerr-bundle.sh "${{ needs.plan.outputs.version }}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seerr-${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          cd dist
+          sha256sum * | tee SHA256SUMS.txt
+          gh release delete "v$VERSION" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Seerr $VERSION" \
+            --notes "Seerr $VERSION from its official release, built for each system with the Node 22.23.4 that runs it. Unpack and run \`node dist/index.js\` inside \`seerr/app\`. SHA-256 sums are in SHA256SUMS.txt." *
