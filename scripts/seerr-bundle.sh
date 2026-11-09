@@ -14,6 +14,9 @@ set -euo pipefail
 
 SEERR_VERSION="${1:?usage: seerr-bundle.sh <seerr-version, e.g. 3.5.1> <out-dir>}"
 OUT_DIR="${2:?usage: seerr-bundle.sh <seerr-version> <out-dir>}"
+# Made absolute now: the script changes folder later, and a relative path would follow it.
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 NODE_VERSION="${NODE_VERSION:-22.23.4}"
 
 have="$(node -v)"
@@ -63,8 +66,7 @@ printf '{"commitTag": "v%s"}\n' "$SEERR_VERSION" > "$stage/app/committag.json"
 cp LICENSE "$stage/LICENSE-seerr"
 cp "$(node -p 'process.execPath')" "$stage/$exe"
 
-mkdir -p "$OUT_DIR"
-archive="$(cd "$OUT_DIR" && pwd)/seerr-$SEERR_VERSION-$name.tar.gz"
+archive="$OUT_DIR/seerr-$SEERR_VERSION-$name.tar.gz"
 tar -czf "$archive" -C "$work/stage" seerr
 echo "$archive"
 sha256sum "$archive"
