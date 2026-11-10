@@ -4,6 +4,7 @@
 //
 //   node seerr-bundle-prune.mjs <staged app folder>
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 
 const app = process.argv[2];
@@ -105,7 +106,106 @@ function trim(modules) {
   }
 }
 
+// A flat install still repeats a package under every package that wants a slightly different
+// version of it than the one at the top. Here 39 packages each carry their own 3.48 of react-aria
+// next to the 3.47 at the top, over a hundred thousand files. When one name@version is nested in
+// three or more places, one copy moves up to the folder they all share, where every one of them
+// finds it, and the others go. It is only done when nothing is lost: the copy sits alone in its
+// folder, and every package below the shared folder that asks for the package accepts that version.
+let sharedCopies = 0;
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// Every package that sits inside another one, with the package that holds it.
+function nestedPackages(modules, owner, out) {
+  for (const pkg of packagesIn(modules)) {
+    if (owner) out.push({ ...pkg, owner, modules });
+    const inner = path.join(pkg.dir, "node_modules");
+    if (fs.existsSync(inner)) nestedPackages(inner, pkg.dir, out);
+  }
+  return out;
+}
+
+function commonDir(dirs) {
+  const parts = dirs.map((d) => path.resolve(d).split(path.sep));
+  let n = 0;
+  while (parts.every((p) => p.length > n && p[n] === parts[0][n])) n++;
+  return parts[0].slice(0, n).join(path.sep);
+}
+
+// Every package under dir that lists name as a dependency, with the range it asks for.
+function wantsOf(dir, name, found = []) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!e.isDirectory() || e.name === ".bin") continue;
+    const sub = path.join(dir, e.name);
+    if (e.name.startsWith("@") && path.basename(dir) === "node_modules") {
+      wantsOf(sub, name, found);
+      continue;
+    }
+    if (e.name === "node_modules") {
+      wantsOf(sub, name, found);
+      continue;
+    }
+    const pj = readJson(path.join(sub, "package.json"));
+    if (pj) {
+      const range = { ...pj.peerDependencies, ...pj.optionalDependencies, ...pj.dependencies }[name];
+      if (range) found.push({ dir: sub, range });
+    }
+    const inner = path.join(sub, "node_modules");
+    if (fs.existsSync(inner)) wantsOf(inner, name, found);
+  }
+  return found;
+}
+
+function shareNested() {
+  let semver;
+  try {
+    semver = createRequire(path.join(root, "x.js"))("semver");
+  } catch {
+    console.log("semver is not installed, nested copies are left as they are");
+    return;
+  }
+  const groups = new Map();
+  for (const n of nestedPackages(root, null, [])) {
+    const v = version(n.dir);
+    if (!v) continue;
+    if (!groups.has(v)) groups.set(v, []);
+    groups.get(v).push(n);
+  }
+  for (const [id, copies] of groups) {
+    if (copies.length < 3) continue;
+    const name = copies[0].name;
+    const ver = id.slice(name.length + 1);
+    // Each copy must be the only package in its folder, or moving it changes what its folder offers.
+    if (!copies.every((c) => packagesIn(c.modules).length === 1)) continue;
+    const shared = commonDir(copies.map((c) => c.owner));
+    const base = path.resolve(root);
+    if (!shared.startsWith(base + path.sep) || shared === base) continue;
+    const target = path.join(shared, "node_modules", name);
+    if (fs.existsSync(target)) continue;
+    // Everything below the shared folder would now find this version, so all of it must accept it.
+    const movedDirs = new Set(copies.map((c) => path.resolve(c.dir)));
+    const wants = wantsOf(shared, name).filter((w) => !movedDirs.has(path.resolve(w.dir)));
+    if (!wants.every((w) => semver.satisfies(ver, w.range))) continue;
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.renameSync(copies[0].dir, target);
+    for (const c of copies.slice(1)) fs.rmSync(c.dir, { recursive: true, force: true });
+    for (const c of copies) {
+      if (fs.existsSync(c.modules) && fs.readdirSync(c.modules).filter((f) => f !== ".bin").length === 0) fs.rmSync(c.modules, { recursive: true, force: true });
+    }
+    sharedCopies += copies.length - 1;
+    console.log(`shared ${id}: ${copies.length} copies became 1 in ${path.relative(base, shared)}`);
+  }
+}
+
 dedupe(root, true);
+shareNested();
 sweep(root);
 trim(root);
 const left = packagesIn(root).length;
@@ -113,4 +213,4 @@ if (left < 300) {
   console.error(`only ${left} packages left in node_modules, something is wrong`);
   process.exit(1);
 }
-console.log(`pruned ${removedCopies} duplicate packages and ${removedFiles} files (${Math.round(removedBytes / 1048576)} MB of maps and types)`);
+console.log(`pruned ${removedCopies} duplicate packages, shared ${sharedCopies} more, and ${removedFiles} files (${Math.round(removedBytes / 1048576)} MB of maps and types)`);
