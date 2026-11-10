@@ -62,7 +62,9 @@ mkdir -p "$stage/app/.next"
 (cd .next && tar -cf - --exclude=./node_modules .) | (cd "$stage/app/.next" && tar -xf -)
 node "$here/seerr-bundle-links.mjs" "$PWD" "$stage/app"
 mkdir -p "$stage/app/config"
-printf '{"commitTag": "v%s"}\n' "$SEERR_VERSION" > "$stage/app/committag.json"
+# No committag.json. Seerr compares the tag its server reports with the one built into its pages. The
+# pages are built here with none, which Seerr calls "local". A tag on only one side makes every page
+# show "Seerr Updated, please reload" again after each reload.
 cp LICENSE "$stage/LICENSE-seerr"
 cp "$(node -p 'process.execPath')" "$stage/$exe"
 
